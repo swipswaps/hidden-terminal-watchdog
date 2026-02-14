@@ -35,40 +35,110 @@ This extension addresses RULE 22 violations where spawning dozens of unreused te
 
 ## Installation
 
-### From Source
+### Quick Install (Recommended)
 
-1. Clone the repository
-2. Run `npm install`
-3. Run `npm run compile`
-4. Press F5 to launch extension development host
+```bash
+cd hidden-terminal-watchdog
+./force-package.sh
+```
 
-### From VSIX
+This script will:
+1. Clean build the extension
+2. Create a VSIX package
+3. Install it automatically
+4. Verify installation
 
-1. Download the `.vsix` file
-2. Run `code --install-extension hidden-terminal-watchdog-1.0.0.vsix`
+After installation, **reload VS Code** (Ctrl+Shift+P → "Reload Window")
+
+### Manual Installation
+
+```bash
+# Build the extension
+npm install
+npm run compile
+
+# Package and install
+./force-package.sh
+
+# Or install manually
+code --install-extension hidden-terminal-watchdog-1.0.0.vsix --force
+```
+
+## Usage
+
+### Commands
+
+Open Command Palette (Ctrl+Shift+P):
+
+- **`Hidden Terminal Watchdog: Show Status`** - Display current terminal count and hidden processes
+- **`Hidden Terminal Watchdog: Force Cleanup`** - Manually kill all hidden terminals
+
+### Log File Location
+
+Logs are written to VS Code's global storage:
+
+```
+~/.config/Code/User/globalStorage/prf-compliance.hidden-terminal-watchdog/watchdog.log
+```
+
+### Example Output
+
+```
+[2026-02-14T23:33:54.228Z] === Hidden Terminal Watchdog Activated ===
+[2026-02-14T23:34:02.723Z] [INFO] Terminal opened: augment-bash-test (tracked: 1)
+[2026-02-14T23:34:03.775Z] [INFO] Terminal closed: augment-bash-test (tracked: 0)
+[2026-02-14T23:34:54.231Z] [HEARTBEAT] Watchdog active. Tracked: 0, Last hidden: 0
+```
+
+## Troubleshooting
+
+### Extension Not Activating
+
+1. Check Output panel: View → Output → "Hidden Terminal Watchdog"
+2. Verify installation: `code --list-extensions | grep hidden-terminal-watchdog`
+3. Reload window: Ctrl+Shift+P → "Reload Window"
+
+### Commands Not Appearing
+
+1. Ensure extension is installed: `code --list-extensions`
+2. Check for activation errors in Output panel
+3. Reinstall: `./force-package.sh`
 
 ## Development
 
+### Build from Source
+
 ```bash
-# Install dependencies
+git clone https://github.com/swipswaps/hidden-terminal-watchdog.git
+cd hidden-terminal-watchdog
 npm install
-
-# Compile TypeScript
 npm run compile
+```
 
-# Watch mode
-npm run watch
+### Project Structure
 
-# Package extension
-npm install -g @vscode/vsce
-vsce package
+```
+hidden-terminal-watchdog/
+├── src/
+│   └── extension.ts          # Main extension code
+├── out/
+│   └── extension.js          # Compiled output
+├── package.json              # Extension manifest
+├── tsconfig.json             # TypeScript config
+├── force-package.sh          # Build and install script
+└── README.md                 # This file
 ```
 
 ## License
 
 MIT
 
-## Author
+## Credits
 
-Created to solve terminal accumulation issues in Augment Agent workflows.
+Created to solve RULE 22 violations in the Augment VSCode extension forensic investigation.
+
+## Links
+
+- **GitHub**: https://github.com/swipswaps/hidden-terminal-watchdog
+- **Issues**: https://github.com/swipswaps/hidden-terminal-watchdog/issues
 

@@ -1,22 +1,68 @@
 import * as vscode from 'vscode';
 import { exec } from 'child_process';
 import * as os from 'os';
+import * as fs from 'fs';
+import * as path from 'path';
 
 interface HiddenTerminalInfo {
     pid: number;
     cmdline: string;
 }
 
+let outputChannel: vscode.OutputChannel;
+let logFilePath: string;
+
+// MANDATORY: Logging to file AND terminal
+function log(message: string) {
+    const timestamp = new Date().toISOString();
+    const logLine = `[${timestamp}] ${message}\n`;
+
+    // Write to file (inside workspace storage)
+    if (logFilePath) {
+        try {
+            fs.appendFileSync(logFilePath, logLine);
+        } catch (err) {
+            console.error('Failed to write to log file:', err);
+        }
+    }
+
+    // Write to VS Code output channel
+    if (outputChannel) {
+        outputChannel.appendLine(message);
+    }
+
+    // Write to console (visible in Extension Development Host)
+    console.log(`[WATCHDOG] ${message}`);
+}
+
 export function activate(context: vscode.ExtensionContext) {
-    const output = vscode.window.createOutputChannel('Hidden Terminal Watchdog');
-    
+    outputChannel = vscode.window.createOutputChannel('Hidden Terminal Watchdog');
+
+    // Use VS Code's storage path (inside workspace or global storage)
+    const storageUri = context.globalStorageUri || context.storageUri;
+    if (storageUri) {
+        // Ensure storage directory exists
+        fs.mkdirSync(storageUri.fsPath, { recursive: true });
+        logFilePath = path.join(storageUri.fsPath, 'watchdog.log');
+    } else {
+        // Fallback: use workspace folder if available
+        const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
+        if (workspaceFolder) {
+            logFilePath = path.join(workspaceFolder.uri.fsPath, '.watchdog.log');
+        }
+    }
+
     const startTime = new Date();
-    output.appendLine(`=== Hidden Terminal Watchdog Activated ===`);
-    output.appendLine(`Start Time: ${startTime.toISOString()}`);
-    output.appendLine(`User: ${os.userInfo().username}`);
-    output.appendLine(`VS Code PID: ${process.pid}`);
-    output.appendLine(`Platform: ${os.platform()}`);
-    output.appendLine('');
+    log('=== Hidden Terminal Watchdog Activated ===');
+    log(`Start Time: ${startTime.toISOString()}`);
+    log(`User: ${os.userInfo().username}`);
+    log(`VS Code PID: ${process.pid}`);
+    log(`Platform: ${os.platform()}`);
+    if (logFilePath) {
+        log(`Log file: ${logFilePath}`);
+    } else {
+        log(`WARNING: No log file path available (no workspace or storage)`);
+    }
 
     // Track all VS Code integrated terminals
     const trackedTerminals = new Set<vscode.Terminal>();
@@ -24,13 +70,13 @@ export function activate(context: vscode.ExtensionContext) {
     // Observe terminal creation
     vscode.window.onDidOpenTerminal((term) => {
         trackedTerminals.add(term);
-        output.appendLine(`[INFO] Terminal opened: ${term.name} (tracked: ${trackedTerminals.size})`);
+        log(`[INFO] Terminal opened: ${term.name} (tracked: ${trackedTerminals.size})`);
     });
 
     // Observe terminal closure
     vscode.window.onDidCloseTerminal((term) => {
         trackedTerminals.delete(term);
-        output.appendLine(`[INFO] Terminal closed: ${term.name} (tracked: ${trackedTerminals.size})`);
+        log(`[INFO] Terminal closed: ${term.name} (tracked: ${trackedTerminals.size})`);
     });
 
     // Internal function: Detect hidden terminals and extension hosts
@@ -86,21 +132,21 @@ export function activate(context: vscode.ExtensionContext) {
 
     const interval = setInterval(async () => {
         const terminals = await detectHiddenTerminals();
-        
+
         if (terminals.length !== lastCount) {
-            output.appendLine(`[MONITOR] Detected ${terminals.length} hidden terminals/processes`);
-            
+            log(`[MONITOR] Detected ${terminals.length} hidden terminals/processes`);
+
             if (terminals.length > 0) {
                 terminals.forEach(t => {
-                    output.appendLine(`  PID ${t.pid}: ${t.cmdline.substring(0, 100)}`);
+                    log(`  PID ${t.pid}: ${t.cmdline.substring(0, 100)}`);
                 });
             }
-            
+
             lastCount = terminals.length;
         }
 
         if (terminals.length > maxTerminals) {
-            output.appendLine(`[WARN] Hidden terminal count (${terminals.length}) exceeds threshold (${maxTerminals})`);
+            log(`[WARN] Hidden terminal count (${terminals.length}) exceeds threshold (${maxTerminals})`);
             vscode.window.showWarningMessage(
                 `Hidden Terminal Watchdog: ${terminals.length} hidden terminals detected (threshold: ${maxTerminals})`,
                 'Cleanup Now',
@@ -112,7 +158,7 @@ export function activate(context: vscode.ExtensionContext) {
             });
 
             if (autoCleanup) {
-                output.appendLine(`[AUTO] Auto-cleanup enabled, running cleanup...`);
+                log(`[AUTO] Auto-cleanup enabled, running cleanup...`);
                 vscode.commands.executeCommand('watchdog.cleanup');
             }
         }
@@ -121,22 +167,22 @@ export function activate(context: vscode.ExtensionContext) {
     // Register monitor command
     const monitorCmd = vscode.commands.registerCommand('watchdog.monitor', async () => {
         const terminals = await detectHiddenTerminals();
-        
-        output.show(true);
-        output.appendLine('');
-        output.appendLine(`=== Manual Status Check ===`);
-        output.appendLine(`Date: ${new Date().toISOString()}`);
-        output.appendLine(`Tracked terminals: ${trackedTerminals.size}`);
-        output.appendLine(`Hidden terminals: ${terminals.length}`);
-        
+
+        outputChannel.show(true);
+        log('');
+        log(`=== Manual Status Check ===`);
+        log(`Date: ${new Date().toISOString()}`);
+        log(`Tracked terminals: ${trackedTerminals.size}`);
+        log(`Hidden terminals: ${terminals.length}`);
+
         if (terminals.length > 0) {
-            output.appendLine('');
-            output.appendLine('Hidden terminal details:');
+            log('');
+            log('Hidden terminal details:');
             terminals.forEach(t => {
-                output.appendLine(`  PID ${t.pid}: ${t.cmdline}`);
+                log(`  PID ${t.pid}: ${t.cmdline}`);
             });
         }
-        
+
         vscode.window.showInformationMessage(
             `Hidden Terminal Watchdog: ${terminals.length} hidden terminals detected`
         );
@@ -147,24 +193,24 @@ export function activate(context: vscode.ExtensionContext) {
         const terminals = await detectHiddenTerminals();
 
         if (terminals.length === 0) {
-            output.appendLine('[CLEANUP] No hidden terminals to cleanup');
+            log('[CLEANUP] No hidden terminals to cleanup');
             vscode.window.showInformationMessage('Hidden Terminal Watchdog: No hidden terminals found');
             return;
         }
 
-        output.show(true);
-        output.appendLine('');
-        output.appendLine(`=== Force Cleanup ===`);
-        output.appendLine(`Date: ${new Date().toISOString()}`);
-        output.appendLine(`Cleaning ${terminals.length} hidden terminals...`);
+        outputChannel.show(true);
+        log('');
+        log(`=== Force Cleanup ===`);
+        log(`Date: ${new Date().toISOString()}`);
+        log(`Cleaning ${terminals.length} hidden terminals...`);
 
         // Send SIGTERM to all processes first
         for (const t of terminals) {
             exec(`kill -15 ${t.pid} 2>/dev/null`, (err) => {
                 if (err) {
-                    output.appendLine(`[WARN] Failed to SIGTERM PID ${t.pid}`);
+                    log(`[WARN] Failed to SIGTERM PID ${t.pid}`);
                 } else {
-                    output.appendLine(`[INFO] Sent SIGTERM to PID ${t.pid}`);
+                    log(`[INFO] Sent SIGTERM to PID ${t.pid}`);
                 }
             });
         }
@@ -179,24 +225,24 @@ export function activate(context: vscode.ExtensionContext) {
                     // Process still exists
                     exec(`kill -9 ${t.pid} 2>/dev/null`, (killErr) => {
                         if (killErr) {
-                            output.appendLine(`[WARN] Failed to SIGKILL PID ${t.pid}`);
+                            log(`[WARN] Failed to SIGKILL PID ${t.pid}`);
                         } else {
-                            output.appendLine(`[INFO] Sent SIGKILL to PID ${t.pid}`);
+                            log(`[INFO] Sent SIGKILL to PID ${t.pid}`);
                         }
                     });
                 } else {
-                    output.appendLine(`[INFO] PID ${t.pid} terminated gracefully`);
+                    log(`[INFO] PID ${t.pid} terminated gracefully`);
                 }
             });
         }
 
-        output.appendLine(`[CLEANUP] Cleanup complete at ${new Date().toISOString()}`);
-        output.appendLine('');
-        output.appendLine('=== Root Cause Analysis ===');
-        output.appendLine('1. launch-process with wait=false creates persistent terminals');
-        output.appendLine('2. Each tool call spawns a new terminal instead of reusing');
-        output.appendLine('3. MCP client doesn\'t clean up on timeout');
-        output.appendLine('4. RULE 22 violation: Terminal accumulation causes instability');
+        log(`[CLEANUP] Cleanup complete at ${new Date().toISOString()}`);
+        log('');
+        log('=== Root Cause Analysis ===');
+        log('1. launch-process with wait=false creates persistent terminals');
+        log('2. Each tool call spawns a new terminal instead of reusing');
+        log('3. MCP client doesn\'t clean up on timeout');
+        log('4. RULE 22 violation: Terminal accumulation causes instability');
 
         vscode.window.showInformationMessage(
             `Hidden Terminal Watchdog: Cleaned ${terminals.length} hidden terminals`
@@ -205,7 +251,7 @@ export function activate(context: vscode.ExtensionContext) {
 
     // Log periodic heartbeat
     const heartbeat = setInterval(() => {
-        output.appendLine(`[HEARTBEAT] Watchdog active. Tracked: ${trackedTerminals.size}, Last hidden: ${lastCount}`);
+        log(`[HEARTBEAT] Watchdog active. Tracked: ${trackedTerminals.size}, Last hidden: ${lastCount}`);
     }, 60000); // Every 60 seconds
 
     // Save subscriptions
@@ -216,11 +262,12 @@ export function activate(context: vscode.ExtensionContext) {
         { dispose: () => clearInterval(heartbeat) }
     );
 
-    output.appendLine('[INFO] Hidden Terminal Watchdog is now monitoring...');
-    output.appendLine('');
+    log('[INFO] Hidden Terminal Watchdog is now monitoring...');
+    log('');
 }
 
 export function deactivate() {
+    log('=== Hidden Terminal Watchdog DEACTIVATED ===');
     // Cleanup handled by context.subscriptions
 }
 
