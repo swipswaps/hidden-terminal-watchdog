@@ -1,0 +1,65 @@
+{
+  "name": "hidden-terminal-watchdog",
+  "displayName": "Hidden Terminal Watchdog",
+  "description": "Monitors and cleans hidden VS Code terminals and extension hosts to prevent RULE 22 violations and MCP instability",
+  "version": "1.0.0",
+  "publisher": "prf-compliance",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "*"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "watchdog.cleanup",
+        "title": "Hidden Terminal Watchdog: Force Cleanup"
+      },
+      {
+        "command": "watchdog.monitor",
+        "title": "Hidden Terminal Watchdog: Show Status"
+      }
+    ],
+    "configuration": {
+      "title": "Hidden Terminal Watchdog",
+      "properties": {
+        "watchdog.monitorInterval": {
+          "type": "number",
+          "default": 5000,
+          "description": "Interval in milliseconds to check for hidden terminals (default: 5000ms)"
+        },
+        "watchdog.maxTerminals": {
+          "type": "number",
+          "default": 20,
+          "description": "Maximum number of hidden terminals before warning (default: 20)"
+        },
+        "watchdog.autoCleanup": {
+          "type": "boolean",
+          "default": false,
+          "description": "Automatically cleanup hidden terminals when threshold is exceeded"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "pretest": "npm run compile",
+    "lint": "eslint src --ext ts"
+  },
+  "devDependencies": {
+    "@types/node": "^20.5.6",
+    "@types/vscode": "^1.90.0",
+    "@typescript-eslint/eslint-plugin": "^6.7.0",
+    "@typescript-eslint/parser": "^6.7.0",
+    "eslint": "^8.49.0",
+    "typescript": "^5.2.2"
+  }
+}
+
