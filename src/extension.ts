@@ -1,486 +1,155 @@
 import * as vscode from 'vscode';
 import { exec } from 'child_process';
-import * as os from 'os';
-import * as fs from 'fs';
-import * as path from 'path';
+import { runWithTee } from './teeRunner';
 
-interface HiddenTerminalInfo {
-    pid: number;
-    cmdline: string;
+const HEARTBEAT_INTERVAL = 60000;
+const PROCESS_SCAN_INTERVAL = 15000;
+const MAX_TERMINALS = 20;
+const MAX_NODE_PROCESSES = 40;
+const EVENT_LOOP_DRIFT_THRESHOLD = 4000;
+
+let lastHeartbeat = Date.now();
+let cancellationEvents = 0;
+let terminalInstance: vscode.Terminal | undefined;
+let outputChannelInstance: vscode.OutputChannel | undefined;
+
+function getTerminal(): vscode.Terminal {
+    if (!terminalInstance || terminalInstance.exitStatus !== undefined) {
+        terminalInstance = vscode.window.createTerminal("Watchdog Monitor");
+    }
+    return terminalInstance;
 }
 
-interface EventLog {
-    timestamp: Date;
-    type: 'terminal_open' | 'terminal_close' | 'monitor' | 'cleanup' | 'warning' | 'system';
-    message: string;
+function getChannel(): vscode.OutputChannel {
+    if (!outputChannelInstance) {
+        outputChannelInstance = vscode.window.createOutputChannel("Watchdog Log");
+    }
+    return outputChannelInstance;
 }
 
-let outputChannel: vscode.OutputChannel;
-let logFilePath: string;
-let recentEvents: EventLog[] = [];
-const EXTENSION_VERSION = '1.0.0';
-const VERSION_MARKER = `WATCHDOG_V${EXTENSION_VERSION.replace(/\./g, '_')}_ACTIVE`;
-
-// MANDATORY: Logging to file AND terminal
-function log(message: string, eventType?: EventLog['type']) {
+function log(message: string) {
     const timestamp = new Date().toISOString();
-    const logLine = `[${timestamp}] ${message}\n`;
+    const terminal = getTerminal();
+    const channel = getChannel();
 
-    // Track recent events for heartbeat
-    if (eventType) {
-        recentEvents.push({
-            timestamp: new Date(),
-            type: eventType,
-            message: message
-        });
-        // Keep only last 20 events
-        if (recentEvents.length > 20) {
-            recentEvents.shift();
-        }
-    }
+    // Tee to terminal (visible to user)
+    terminal.sendText(`[${timestamp}] ${message}`, false);
 
-    // Write to file (inside workspace storage)
-    if (logFilePath) {
-        try {
-            fs.appendFileSync(logFilePath, logLine);
-        } catch (err) {
-            console.error('Failed to write to log file:', err);
-        }
-    }
+    // Also log to output channel
+    channel.appendLine(`[${timestamp}] ${message}`);
 
-    // Write to VS Code output channel
-    if (outputChannel) {
-        outputChannel.appendLine(message);
-    }
-
-    // Write to console (visible in Extension Development Host)
-    console.log(`[WATCHDOG] ${message}`);
+    // Console for debugging
+    console.log(`[WATCHDOG ${timestamp}] ${message}`);
 }
 
-// CRITICAL: Monitor for "Cancelled by user" errors from Augment extension
-function monitorCancelledByUserErrors(context: vscode.ExtensionContext) {
-    // Monitor VS Code's diagnostic collection for errors
-    const diagnosticListener = vscode.languages.onDidChangeDiagnostics((event) => {
+export function activate(context: vscode.ExtensionContext) {
+    log("Watchdog activated.");
+
+    // Show terminal immediately
+    const terminal = getTerminal();
+    terminal.show(true);
+
+    monitorEventLoop();
+    monitorTerminals();
+    monitorProcesses();
+    monitorCancellationPatterns();
+
+    setInterval(heartbeat, HEARTBEAT_INTERVAL);
+}
+
+function heartbeat() {
+    log(`HEARTBEAT | terminals=${vscode.window.terminals.length} | cancellations=${cancellationEvents}`);
+}
+
+function monitorEventLoop() {
+    let lastTick = Date.now();
+
+    setInterval(() => {
+        const now = Date.now();
+        const drift = now - lastTick - HEARTBEAT_INTERVAL;
+
+        if (drift > EVENT_LOOP_DRIFT_THRESHOLD) {
+            log(`CRITICAL | Event loop stall detected | drift=${drift}ms`);
+            attemptRecovery("event-loop-stall");
+        }
+
+        lastTick = now;
+    }, HEARTBEAT_INTERVAL);
+}
+
+function monitorTerminals() {
+    vscode.window.onDidOpenTerminal(() => {
+        const count = vscode.window.terminals.length;
+        log(`INFO | Terminal opened | count=${count}`);
+
+        if (count > MAX_TERMINALS) {
+            log(`WARNING | Terminal overload detected | count=${count}`);
+            cleanupTerminals();
+        }
+    });
+
+    vscode.window.onDidCloseTerminal(() => {
+        log(`INFO | Terminal closed | count=${vscode.window.terminals.length}`);
+    });
+}
+
+function cleanupTerminals() {
+    vscode.window.terminals.forEach(term => {
+        if (!term.name.includes("persistent") && !term.name.includes("Watchdog")) {
+            term.dispose();
+        }
+    });
+
+    log("ACTION | Non-persistent terminals disposed.");
+}
+
+function monitorProcesses() {
+    setInterval(() => {
+        exec("ps -eo pid,comm | grep -E 'node|npm' | grep -v grep", (err, stdout) => {
+            if (err || !stdout) return;
+
+            const processes = stdout.split('\n').filter(Boolean);
+
+            if (processes.length > MAX_NODE_PROCESSES) {
+                log(`CRITICAL | Node process overload | count=${processes.length}`);
+                attemptRecovery("node-overload");
+            }
+        });
+    }, PROCESS_SCAN_INTERVAL);
+}
+
+function monitorCancellationPatterns() {
+    // Monitor for "Cancelled by user" errors by checking VS Code diagnostics
+    vscode.languages.onDidChangeDiagnostics((event) => {
         event.uris.forEach(uri => {
             const diagnostics = vscode.languages.getDiagnostics(uri);
             diagnostics.forEach(diag => {
                 if (diag.message.includes('Cancelled by user')) {
-                    log(`[ERROR-DETECTED] "Cancelled by user" error at ${uri.fsPath}:${diag.range.start.line}`, 'warning');
-                    log(`[ERROR-CONTEXT] Message: ${diag.message}`, 'warning');
-                    log(`[ROOT-CAUSE] this._cancelledByUser flag was set in Augment extension`, 'system');
-                    log(`[LOCATION] ~/.vscode/extensions/augment.vscode-augment-*/out/extension.js:235911`, 'system');
+                    cancellationEvents++;
+                    log(`DETECTED | Cancellation pattern in diagnostics | total=${cancellationEvents}`);
+                    log(`LOCATION | ${uri.fsPath}:${diag.range.start.line}`);
+                    attemptRecovery("cancellation-pattern");
                 }
             });
         });
     });
-
-    // Monitor terminal output for "Cancelled by user" messages AND tool execution
-    let cancelledByUserCount = 0;
-    let lastProcessCount = 0;
-
-    const terminalMonitor = setInterval(() => {
-        // REAL-TIME: Show what processes are running RIGHT NOW
-        exec(`ps aux | grep -E '[n]ode.*vsce|[n]pm.*compile|[t]sc.*-p' | wc -l`, (psErr, psOut) => {
-            const processCount = parseInt(psOut.trim(), 10);
-            if (processCount !== lastProcessCount) {
-                log(`[PROCESS-MONITOR] Active build processes: ${processCount}`, 'monitor');
-                if (processCount > 0) {
-                    exec(`ps aux | grep -E '[n]ode.*vsce|[n]pm.*compile|[t]sc.*-p' | head -5`, (detailErr, detailOut) => {
-                        if (!detailErr && detailOut.trim()) {
-                            detailOut.trim().split('\n').forEach(line => {
-                                const parts = line.split(/\s+/);
-                                const pid = parts[1];
-                                const cmd = parts.slice(10).join(' ').substring(0, 80);
-                                log(`  [PID ${pid}] ${cmd}`, 'monitor');
-                            });
-                        }
-                    });
-                }
-                lastProcessCount = processCount;
-            }
-        });
-
-        // Check Augment log files for "Cancelled by user" errors
-        const augmentLogPattern = path.join(os.homedir(), '.config/Code/logs/*/Augment.vscode-augment/Augment.log');
-
-        exec(`find ${path.dirname(augmentLogPattern)} -name "Augment.log" -type f 2>/dev/null | head -1`, (err, stdout) => {
-            if (!err && stdout.trim()) {
-                const logFile = stdout.trim();
-                exec(`grep -c "Cancelled by user" "${logFile}" 2>/dev/null || echo "0"`, (_grepErr, grepOut) => {
-                    const count = parseInt(grepOut.trim(), 10);
-                    if (count > cancelledByUserCount) {
-                        const newErrors = count - cancelledByUserCount;
-                        log(`[CRITICAL] Detected ${newErrors} new "Cancelled by user" error(s) in Augment log`, 'warning');
-                        log(`[TOTAL] Total "Cancelled by user" errors: ${count}`, 'warning');
-                        log(`[DIAGNOSIS] MCP client instability detected - likely due to terminal accumulation`, 'system');
-                        log(`[REMEDY] Run cleanup command or reload VS Code window`, 'system');
-                        log(`[CODE-LOCATION] ~/.vscode/extensions/augment.vscode-augment-*/out/extension.js:235911`, 'system');
-                        log(`[FLAG-SET] this._cancelledByUser = true (one-way latch, never reset)`, 'system');
-
-                        cancelledByUserCount = count;
-
-                        // Show warning to user
-                        vscode.window.showWarningMessage(
-                            `Hidden Terminal Watchdog: Detected ${newErrors} "Cancelled by user" error(s). MCP instability likely.`,
-                            'Cleanup Terminals',
-                            'Reload Window',
-                            'Dismiss'
-                        ).then(selection => {
-                            if (selection === 'Cleanup Terminals') {
-                                vscode.commands.executeCommand('watchdog.cleanup');
-                            } else if (selection === 'Reload Window') {
-                                vscode.commands.executeCommand('workbench.action.reloadWindow');
-                            }
-                        });
-                    }
-                });
-            }
-        });
-    }, 5000); // Check every 5 seconds for real-time monitoring
-
-    context.subscriptions.push(
-        diagnosticListener,
-        { dispose: () => clearInterval(terminalMonitor) }
-    );
-
-    log('[MONITOR] "Cancelled by user" error monitoring activated', 'system');
 }
 
-// SELF-HEALING: Detect if extension is running stale/cached code
-function checkForStaleCode(context: vscode.ExtensionContext) {
-    const versionFilePath = context.globalStorageUri ?
-        path.join(context.globalStorageUri.fsPath, 'version.txt') : null;
+function attemptRecovery(reason: string) {
+    log(`RECOVERY | Initiating self-heal | reason=${reason}`);
 
-    if (!versionFilePath) {
-        log('[WARN] Cannot check for stale code - no storage path', 'warning');
-        return;
-    }
+    cleanupTerminals();
 
-    try {
-        // Check if version file exists
-        if (fs.existsSync(versionFilePath)) {
-            const storedVersion = fs.readFileSync(versionFilePath, 'utf8').trim();
-
-            if (storedVersion !== VERSION_MARKER) {
-                log(`[CRITICAL] STALE CODE DETECTED! Stored: ${storedVersion}, Current: ${VERSION_MARKER}`, 'warning');
-                log('[SELF-HEAL] VS Code extension cache is stale. Triggering reload...', 'system');
-
-                // Write new version marker
-                fs.writeFileSync(versionFilePath, VERSION_MARKER);
-
-                // Show warning and offer to reload
-                vscode.window.showWarningMessage(
-                    'Hidden Terminal Watchdog: Extension code is stale. Reload window to activate new version.',
-                    'Reload Now',
-                    'Later'
-                ).then(selection => {
-                    if (selection === 'Reload Now') {
-                        vscode.commands.executeCommand('workbench.action.reloadWindow');
-                    }
-                });
-
-                return;
-            } else {
-                log(`[OK] Version check passed: ${VERSION_MARKER}`, 'system');
-            }
-        } else {
-            // First run - create version file
-            fs.writeFileSync(versionFilePath, VERSION_MARKER);
-            log(`[INIT] Version marker created: ${VERSION_MARKER}`, 'system');
+    vscode.window.showWarningMessage(
+        `Watchdog detected instability (${reason}). Reload window?`,
+        "Reload"
+    ).then(choice => {
+        if (choice === "Reload") {
+            vscode.commands.executeCommand("workbench.action.reloadWindow");
         }
-    } catch (err) {
-        log(`[ERROR] Version check failed: ${err}`, 'warning');
-    }
-}
-
-export function activate(context: vscode.ExtensionContext) {
-    outputChannel = vscode.window.createOutputChannel('Hidden Terminal Watchdog');
-
-    // Use VS Code's storage path (inside workspace or global storage)
-    const storageUri = context.globalStorageUri || context.storageUri;
-    if (storageUri) {
-        // Ensure storage directory exists
-        fs.mkdirSync(storageUri.fsPath, { recursive: true });
-        logFilePath = path.join(storageUri.fsPath, 'watchdog.log');
-    } else {
-        // Fallback: use workspace folder if available
-        const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
-        if (workspaceFolder) {
-            logFilePath = path.join(workspaceFolder.uri.fsPath, '.watchdog.log');
-        }
-    }
-
-    const startTime = new Date();
-    log('=== Hidden Terminal Watchdog Activated ===', 'system');
-    log(`Version: ${EXTENSION_VERSION} (${VERSION_MARKER})`, 'system');
-    log(`Start Time: ${startTime.toISOString()}`, 'system');
-    log(`User: ${os.userInfo().username}`, 'system');
-    log(`VS Code PID: ${process.pid}`, 'system');
-    log(`Platform: ${os.platform()}`, 'system');
-    if (logFilePath) {
-        log(`Log file: ${logFilePath}`, 'system');
-    } else {
-        log(`WARNING: No log file path available (no workspace or storage)`, 'warning');
-    }
-
-    // SELF-HEALING: Check if extension code is stale
-    checkForStaleCode(context);
-
-    // CRITICAL: Monitor for "Cancelled by user" errors
-    monitorCancelledByUserErrors(context);
-
-    // Track all VS Code integrated terminals
-    const trackedTerminals = new Set<vscode.Terminal>();
-
-    // Observe terminal creation
-    vscode.window.onDidOpenTerminal((term) => {
-        trackedTerminals.add(term);
-        log(`[INFO] Terminal opened: ${term.name} (tracked: ${trackedTerminals.size})`, 'terminal_open');
     });
-
-    // Observe terminal closure
-    vscode.window.onDidCloseTerminal((term) => {
-        trackedTerminals.delete(term);
-        log(`[INFO] Terminal closed: ${term.name} (tracked: ${trackedTerminals.size})`, 'terminal_close');
-    });
-
-    // Internal function: Detect hidden terminals and extension hosts
-    function detectHiddenTerminals(): Promise<HiddenTerminalInfo[]> {
-        return new Promise((resolve) => {
-            // Only detect VS Code extension hosts and terminal processes
-            // Do NOT detect shell processes - too broad and causes false positives
-            const pattern = 'code.*--ms-enable-electron-run-as-node|extensionHost';
-            const username = os.userInfo().username;
-            
-            exec(`pgrep -u ${username} -f "${pattern}"`, (err, stdout, stderr) => {
-                if (err) {
-                    // No matches found
-                    resolve([]);
-                    return;
-                }
-
-                const pids = stdout.split(/\s+/).filter(Boolean).map(p => parseInt(p, 10));
-                
-                if (pids.length === 0) {
-                    resolve([]);
-                    return;
-                }
-
-                // Get command lines for each PID
-                const results: HiddenTerminalInfo[] = [];
-                let pending = pids.length;
-
-                pids.forEach((pid) => {
-                    exec(`tr '\\0' ' ' < /proc/${pid}/cmdline 2>/dev/null`, (cmdErr, cmdOut) => {
-                        results.push({
-                            pid,
-                            cmdline: cmdErr || !cmdOut.trim() ? '[cmdline unavailable]' : cmdOut.trim()
-                        });
-                        
-                        pending--;
-                        if (pending === 0) {
-                            resolve(results);
-                        }
-                    });
-                });
-            });
-        });
-    }
-
-    // Monitor hidden terminals periodically
-    const config = vscode.workspace.getConfiguration('watchdog');
-    const monitorInterval = config.get<number>('monitorInterval', 5000);
-    const maxTerminals = config.get<number>('maxTerminals', 20);
-    const autoCleanup = config.get<boolean>('autoCleanup', false);
-
-    let lastCount = 0;
-
-    const interval = setInterval(async () => {
-        const terminals = await detectHiddenTerminals();
-
-        if (terminals.length !== lastCount) {
-            log(`[MONITOR] Detected ${terminals.length} hidden terminals/processes`, 'monitor');
-
-            if (terminals.length > 0) {
-                terminals.forEach(t => {
-                    log(`  PID ${t.pid}: ${t.cmdline.substring(0, 100)}`);
-                });
-            }
-
-            lastCount = terminals.length;
-        }
-
-        if (terminals.length > maxTerminals) {
-            log(`[WARN] Hidden terminal count (${terminals.length}) exceeds threshold (${maxTerminals})`, 'warning');
-            vscode.window.showWarningMessage(
-                `Hidden Terminal Watchdog: ${terminals.length} hidden terminals detected (threshold: ${maxTerminals})`,
-                'Cleanup Now',
-                'Dismiss'
-            ).then(selection => {
-                if (selection === 'Cleanup Now') {
-                    vscode.commands.executeCommand('watchdog.cleanup');
-                }
-            });
-
-            if (autoCleanup) {
-                log(`[AUTO] Auto-cleanup enabled, running cleanup...`, 'system');
-                vscode.commands.executeCommand('watchdog.cleanup');
-            }
-        }
-    }, monitorInterval);
-
-    // Register monitor command
-    const monitorCmd = vscode.commands.registerCommand('watchdog.monitor', async () => {
-        const terminals = await detectHiddenTerminals();
-
-        outputChannel.show(true);
-        log('');
-        log(`=== Manual Status Check ===`);
-        log(`Date: ${new Date().toISOString()}`);
-        log(`Tracked terminals: ${trackedTerminals.size}`);
-        log(`Hidden terminals: ${terminals.length}`);
-
-        if (terminals.length > 0) {
-            log('');
-            log('Hidden terminal details:');
-            terminals.forEach(t => {
-                log(`  PID ${t.pid}: ${t.cmdline}`);
-            });
-        }
-
-        vscode.window.showInformationMessage(
-            `Hidden Terminal Watchdog: ${terminals.length} hidden terminals detected`
-        );
-    });
-
-    // Register cleanup command
-    const cleanupCmd = vscode.commands.registerCommand('watchdog.cleanup', async () => {
-        const terminals = await detectHiddenTerminals();
-
-        if (terminals.length === 0) {
-            log('[CLEANUP] No hidden terminals to cleanup', 'cleanup');
-            vscode.window.showInformationMessage('Hidden Terminal Watchdog: No hidden terminals found');
-            return;
-        }
-
-        outputChannel.show(true);
-        log('');
-        log(`=== Force Cleanup ===`, 'cleanup');
-        log(`Date: ${new Date().toISOString()}`);
-        log(`Cleaning ${terminals.length} hidden terminals...`);
-
-        // Send SIGTERM to all processes first
-        for (const t of terminals) {
-            exec(`kill -15 ${t.pid} 2>/dev/null`, (err) => {
-                if (err) {
-                    log(`[WARN] Failed to SIGTERM PID ${t.pid}`);
-                } else {
-                    log(`[INFO] Sent SIGTERM to PID ${t.pid}`);
-                }
-            });
-        }
-
-        // Wait briefly for graceful shutdown
-        await new Promise(resolve => setTimeout(resolve, 1000));
-
-        // Send SIGKILL to any survivors
-        for (const t of terminals) {
-            exec(`kill -0 ${t.pid} 2>/dev/null`, (checkErr) => {
-                if (!checkErr) {
-                    // Process still exists
-                    exec(`kill -9 ${t.pid} 2>/dev/null`, (killErr) => {
-                        if (killErr) {
-                            log(`[WARN] Failed to SIGKILL PID ${t.pid}`);
-                        } else {
-                            log(`[INFO] Sent SIGKILL to PID ${t.pid}`);
-                        }
-                    });
-                } else {
-                    log(`[INFO] PID ${t.pid} terminated gracefully`);
-                }
-            });
-        }
-
-        log(`[CLEANUP] Cleanup complete at ${new Date().toISOString()}`);
-        log('');
-        log('=== Root Cause Analysis ===');
-        log('1. launch-process with wait=false creates persistent terminals');
-        log('2. Each tool call spawns a new terminal instead of reusing');
-        log('3. MCP client doesn\'t clean up on timeout');
-        log('4. RULE 22 violation: Terminal accumulation causes instability');
-
-        vscode.window.showInformationMessage(
-            `Hidden Terminal Watchdog: Cleaned ${terminals.length} hidden terminals`
-        );
-    });
-
-    // Log periodic heartbeat with recent events
-    const heartbeat = setInterval(() => {
-        const now = new Date();
-        const recentWindow = 60000; // Last 60 seconds
-        const recentEventsInWindow = recentEvents.filter(e =>
-            (now.getTime() - e.timestamp.getTime()) < recentWindow
-        );
-
-        // Build heartbeat message with event summary
-        let heartbeatMsg = `[HEARTBEAT] Watchdog active. Tracked: ${trackedTerminals.size}, Last hidden: ${lastCount}`;
-
-        if (recentEventsInWindow.length > 0) {
-            // Count events by type
-            const eventCounts = {
-                terminal_open: 0,
-                terminal_close: 0,
-                monitor: 0,
-                cleanup: 0,
-                warning: 0,
-                system: 0
-            };
-
-            recentEventsInWindow.forEach(e => {
-                eventCounts[e.type]++;
-            });
-
-            // Add event summary to heartbeat
-            const eventSummary: string[] = [];
-            if (eventCounts.terminal_open > 0) eventSummary.push(`${eventCounts.terminal_open} opened`);
-            if (eventCounts.terminal_close > 0) eventSummary.push(`${eventCounts.terminal_close} closed`);
-            if (eventCounts.monitor > 0) eventSummary.push(`${eventCounts.monitor} monitor`);
-            if (eventCounts.cleanup > 0) eventSummary.push(`${eventCounts.cleanup} cleanup`);
-            if (eventCounts.warning > 0) eventSummary.push(`${eventCounts.warning} warnings`);
-            if (eventCounts.system > 0) eventSummary.push(`${eventCounts.system} system`);
-
-            if (eventSummary.length > 0) {
-                heartbeatMsg += ` | Events (60s): ${eventSummary.join(', ')}`;
-            }
-
-            // Add last 3 event messages
-            const lastThree = recentEventsInWindow.slice(-3);
-            if (lastThree.length > 0) {
-                heartbeatMsg += ` | Recent: `;
-                lastThree.forEach((e, i) => {
-                    const timeAgo = Math.floor((now.getTime() - e.timestamp.getTime()) / 1000);
-                    heartbeatMsg += `${i > 0 ? '; ' : ''}[${timeAgo}s ago] ${e.message}`;
-                });
-            }
-        }
-
-        log(heartbeatMsg);
-    }, 60000); // Every 60 seconds
-
-    // Save subscriptions
-    context.subscriptions.push(
-        monitorCmd,
-        cleanupCmd,
-        { dispose: () => clearInterval(interval) },
-        { dispose: () => clearInterval(heartbeat) }
-    );
-
-    log('[INFO] Hidden Terminal Watchdog is now monitoring...');
-    log('');
 }
 
 export function deactivate() {
-    log('=== Hidden Terminal Watchdog DEACTIVATED ===');
-    // Cleanup handled by context.subscriptions
+    log("Watchdog deactivated.");
 }
-
