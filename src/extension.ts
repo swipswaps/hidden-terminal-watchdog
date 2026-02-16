@@ -57,6 +57,95 @@ function log(message: string, eventType?: EventLog['type']) {
     console.log(`[WATCHDOG] ${message}`);
 }
 
+// CRITICAL: Monitor for "Cancelled by user" errors from Augment extension
+function monitorCancelledByUserErrors(context: vscode.ExtensionContext) {
+    // Monitor VS Code's diagnostic collection for errors
+    const diagnosticListener = vscode.languages.onDidChangeDiagnostics((event) => {
+        event.uris.forEach(uri => {
+            const diagnostics = vscode.languages.getDiagnostics(uri);
+            diagnostics.forEach(diag => {
+                if (diag.message.includes('Cancelled by user')) {
+                    log(`[ERROR-DETECTED] "Cancelled by user" error at ${uri.fsPath}:${diag.range.start.line}`, 'warning');
+                    log(`[ERROR-CONTEXT] Message: ${diag.message}`, 'warning');
+                    log(`[ROOT-CAUSE] this._cancelledByUser flag was set in Augment extension`, 'system');
+                    log(`[LOCATION] ~/.vscode/extensions/augment.vscode-augment-*/out/extension.js:235911`, 'system');
+                }
+            });
+        });
+    });
+
+    // Monitor terminal output for "Cancelled by user" messages AND tool execution
+    let cancelledByUserCount = 0;
+    let lastProcessCount = 0;
+
+    const terminalMonitor = setInterval(() => {
+        // REAL-TIME: Show what processes are running RIGHT NOW
+        exec(`ps aux | grep -E '[n]ode.*vsce|[n]pm.*compile|[t]sc.*-p' | wc -l`, (psErr, psOut) => {
+            const processCount = parseInt(psOut.trim(), 10);
+            if (processCount !== lastProcessCount) {
+                log(`[PROCESS-MONITOR] Active build processes: ${processCount}`, 'monitor');
+                if (processCount > 0) {
+                    exec(`ps aux | grep -E '[n]ode.*vsce|[n]pm.*compile|[t]sc.*-p' | head -5`, (detailErr, detailOut) => {
+                        if (!detailErr && detailOut.trim()) {
+                            detailOut.trim().split('\n').forEach(line => {
+                                const parts = line.split(/\s+/);
+                                const pid = parts[1];
+                                const cmd = parts.slice(10).join(' ').substring(0, 80);
+                                log(`  [PID ${pid}] ${cmd}`, 'monitor');
+                            });
+                        }
+                    });
+                }
+                lastProcessCount = processCount;
+            }
+        });
+
+        // Check Augment log files for "Cancelled by user" errors
+        const augmentLogPattern = path.join(os.homedir(), '.config/Code/logs/*/Augment.vscode-augment/Augment.log');
+
+        exec(`find ${path.dirname(augmentLogPattern)} -name "Augment.log" -type f 2>/dev/null | head -1`, (err, stdout) => {
+            if (!err && stdout.trim()) {
+                const logFile = stdout.trim();
+                exec(`grep -c "Cancelled by user" "${logFile}" 2>/dev/null || echo "0"`, (_grepErr, grepOut) => {
+                    const count = parseInt(grepOut.trim(), 10);
+                    if (count > cancelledByUserCount) {
+                        const newErrors = count - cancelledByUserCount;
+                        log(`[CRITICAL] Detected ${newErrors} new "Cancelled by user" error(s) in Augment log`, 'warning');
+                        log(`[TOTAL] Total "Cancelled by user" errors: ${count}`, 'warning');
+                        log(`[DIAGNOSIS] MCP client instability detected - likely due to terminal accumulation`, 'system');
+                        log(`[REMEDY] Run cleanup command or reload VS Code window`, 'system');
+                        log(`[CODE-LOCATION] ~/.vscode/extensions/augment.vscode-augment-*/out/extension.js:235911`, 'system');
+                        log(`[FLAG-SET] this._cancelledByUser = true (one-way latch, never reset)`, 'system');
+
+                        cancelledByUserCount = count;
+
+                        // Show warning to user
+                        vscode.window.showWarningMessage(
+                            `Hidden Terminal Watchdog: Detected ${newErrors} "Cancelled by user" error(s). MCP instability likely.`,
+                            'Cleanup Terminals',
+                            'Reload Window',
+                            'Dismiss'
+                        ).then(selection => {
+                            if (selection === 'Cleanup Terminals') {
+                                vscode.commands.executeCommand('watchdog.cleanup');
+                            } else if (selection === 'Reload Window') {
+                                vscode.commands.executeCommand('workbench.action.reloadWindow');
+                            }
+                        });
+                    }
+                });
+            }
+        });
+    }, 5000); // Check every 5 seconds for real-time monitoring
+
+    context.subscriptions.push(
+        diagnosticListener,
+        { dispose: () => clearInterval(terminalMonitor) }
+    );
+
+    log('[MONITOR] "Cancelled by user" error monitoring activated', 'system');
+}
+
 // SELF-HEALING: Detect if extension is running stale/cached code
 function checkForStaleCode(context: vscode.ExtensionContext) {
     const versionFilePath = context.globalStorageUri ?
@@ -136,6 +225,9 @@ export function activate(context: vscode.ExtensionContext) {
 
     // SELF-HEALING: Check if extension code is stale
     checkForStaleCode(context);
+
+    // CRITICAL: Monitor for "Cancelled by user" errors
+    monitorCancelledByUserErrors(context);
 
     // Track all VS Code integrated terminals
     const trackedTerminals = new Set<vscode.Terminal>();
