@@ -18,6 +18,8 @@ interface EventLog {
 let outputChannel: vscode.OutputChannel;
 let logFilePath: string;
 let recentEvents: EventLog[] = [];
+const EXTENSION_VERSION = '1.0.0';
+const VERSION_MARKER = `WATCHDOG_V${EXTENSION_VERSION.replace(/\./g, '_')}_ACTIVE`;
 
 // MANDATORY: Logging to file AND terminal
 function log(message: string, eventType?: EventLog['type']) {
@@ -55,6 +57,53 @@ function log(message: string, eventType?: EventLog['type']) {
     console.log(`[WATCHDOG] ${message}`);
 }
 
+// SELF-HEALING: Detect if extension is running stale/cached code
+function checkForStaleCode(context: vscode.ExtensionContext) {
+    const versionFilePath = context.globalStorageUri ?
+        path.join(context.globalStorageUri.fsPath, 'version.txt') : null;
+
+    if (!versionFilePath) {
+        log('[WARN] Cannot check for stale code - no storage path', 'warning');
+        return;
+    }
+
+    try {
+        // Check if version file exists
+        if (fs.existsSync(versionFilePath)) {
+            const storedVersion = fs.readFileSync(versionFilePath, 'utf8').trim();
+
+            if (storedVersion !== VERSION_MARKER) {
+                log(`[CRITICAL] STALE CODE DETECTED! Stored: ${storedVersion}, Current: ${VERSION_MARKER}`, 'warning');
+                log('[SELF-HEAL] VS Code extension cache is stale. Triggering reload...', 'system');
+
+                // Write new version marker
+                fs.writeFileSync(versionFilePath, VERSION_MARKER);
+
+                // Show warning and offer to reload
+                vscode.window.showWarningMessage(
+                    'Hidden Terminal Watchdog: Extension code is stale. Reload window to activate new version.',
+                    'Reload Now',
+                    'Later'
+                ).then(selection => {
+                    if (selection === 'Reload Now') {
+                        vscode.commands.executeCommand('workbench.action.reloadWindow');
+                    }
+                });
+
+                return;
+            } else {
+                log(`[OK] Version check passed: ${VERSION_MARKER}`, 'system');
+            }
+        } else {
+            // First run - create version file
+            fs.writeFileSync(versionFilePath, VERSION_MARKER);
+            log(`[INIT] Version marker created: ${VERSION_MARKER}`, 'system');
+        }
+    } catch (err) {
+        log(`[ERROR] Version check failed: ${err}`, 'warning');
+    }
+}
+
 export function activate(context: vscode.ExtensionContext) {
     outputChannel = vscode.window.createOutputChannel('Hidden Terminal Watchdog');
 
@@ -73,16 +122,20 @@ export function activate(context: vscode.ExtensionContext) {
     }
 
     const startTime = new Date();
-    log('=== Hidden Terminal Watchdog Activated ===');
-    log(`Start Time: ${startTime.toISOString()}`);
-    log(`User: ${os.userInfo().username}`);
-    log(`VS Code PID: ${process.pid}`);
-    log(`Platform: ${os.platform()}`);
+    log('=== Hidden Terminal Watchdog Activated ===', 'system');
+    log(`Version: ${EXTENSION_VERSION} (${VERSION_MARKER})`, 'system');
+    log(`Start Time: ${startTime.toISOString()}`, 'system');
+    log(`User: ${os.userInfo().username}`, 'system');
+    log(`VS Code PID: ${process.pid}`, 'system');
+    log(`Platform: ${os.platform()}`, 'system');
     if (logFilePath) {
-        log(`Log file: ${logFilePath}`);
+        log(`Log file: ${logFilePath}`, 'system');
     } else {
-        log(`WARNING: No log file path available (no workspace or storage)`);
+        log(`WARNING: No log file path available (no workspace or storage)`, 'warning');
     }
+
+    // SELF-HEALING: Check if extension code is stale
+    checkForStaleCode(context);
 
     // Track all VS Code integrated terminals
     const trackedTerminals = new Set<vscode.Terminal>();
