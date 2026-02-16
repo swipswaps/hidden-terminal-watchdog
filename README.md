@@ -88,7 +88,14 @@ Logs are written to VS Code's global storage:
 [2026-02-14T23:34:02.723Z] [INFO] Terminal opened: augment-bash-test (tracked: 1)
 [2026-02-14T23:34:03.775Z] [INFO] Terminal closed: augment-bash-test (tracked: 0)
 [2026-02-14T23:34:54.231Z] [HEARTBEAT] Watchdog active. Tracked: 0, Last hidden: 0
+[2026-02-14T23:35:54.231Z] [HEARTBEAT] Watchdog active. Tracked: 2, Last hidden: 0 | Events (60s): 2 opened, 1 closed, 1 monitor | Recent: [45s ago] [INFO] Terminal opened: bash (tracked: 1); [30s ago] [INFO] Terminal opened: zsh (tracked: 2); [15s ago] [MONITOR] Detected 0 hidden terminals/processes
 ```
+
+**Heartbeat Features:**
+- Shows current tracked terminals and last hidden count
+- Summarizes events in the last 60 seconds by type (opened, closed, monitor, cleanup, warnings, system)
+- Displays the last 3 event messages with timestamps
+- Helps diagnose terminal accumulation patterns and MCP instability
 
 ## Troubleshooting
 

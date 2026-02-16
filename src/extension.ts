@@ -9,13 +9,33 @@ interface HiddenTerminalInfo {
     cmdline: string;
 }
 
+interface EventLog {
+    timestamp: Date;
+    type: 'terminal_open' | 'terminal_close' | 'monitor' | 'cleanup' | 'warning' | 'system';
+    message: string;
+}
+
 let outputChannel: vscode.OutputChannel;
 let logFilePath: string;
+let recentEvents: EventLog[] = [];
 
 // MANDATORY: Logging to file AND terminal
-function log(message: string) {
+function log(message: string, eventType?: EventLog['type']) {
     const timestamp = new Date().toISOString();
     const logLine = `[${timestamp}] ${message}\n`;
+
+    // Track recent events for heartbeat
+    if (eventType) {
+        recentEvents.push({
+            timestamp: new Date(),
+            type: eventType,
+            message: message
+        });
+        // Keep only last 20 events
+        if (recentEvents.length > 20) {
+            recentEvents.shift();
+        }
+    }
 
     // Write to file (inside workspace storage)
     if (logFilePath) {
@@ -70,13 +90,13 @@ export function activate(context: vscode.ExtensionContext) {
     // Observe terminal creation
     vscode.window.onDidOpenTerminal((term) => {
         trackedTerminals.add(term);
-        log(`[INFO] Terminal opened: ${term.name} (tracked: ${trackedTerminals.size})`);
+        log(`[INFO] Terminal opened: ${term.name} (tracked: ${trackedTerminals.size})`, 'terminal_open');
     });
 
     // Observe terminal closure
     vscode.window.onDidCloseTerminal((term) => {
         trackedTerminals.delete(term);
-        log(`[INFO] Terminal closed: ${term.name} (tracked: ${trackedTerminals.size})`);
+        log(`[INFO] Terminal closed: ${term.name} (tracked: ${trackedTerminals.size})`, 'terminal_close');
     });
 
     // Internal function: Detect hidden terminals and extension hosts
@@ -134,7 +154,7 @@ export function activate(context: vscode.ExtensionContext) {
         const terminals = await detectHiddenTerminals();
 
         if (terminals.length !== lastCount) {
-            log(`[MONITOR] Detected ${terminals.length} hidden terminals/processes`);
+            log(`[MONITOR] Detected ${terminals.length} hidden terminals/processes`, 'monitor');
 
             if (terminals.length > 0) {
                 terminals.forEach(t => {
@@ -146,7 +166,7 @@ export function activate(context: vscode.ExtensionContext) {
         }
 
         if (terminals.length > maxTerminals) {
-            log(`[WARN] Hidden terminal count (${terminals.length}) exceeds threshold (${maxTerminals})`);
+            log(`[WARN] Hidden terminal count (${terminals.length}) exceeds threshold (${maxTerminals})`, 'warning');
             vscode.window.showWarningMessage(
                 `Hidden Terminal Watchdog: ${terminals.length} hidden terminals detected (threshold: ${maxTerminals})`,
                 'Cleanup Now',
@@ -158,7 +178,7 @@ export function activate(context: vscode.ExtensionContext) {
             });
 
             if (autoCleanup) {
-                log(`[AUTO] Auto-cleanup enabled, running cleanup...`);
+                log(`[AUTO] Auto-cleanup enabled, running cleanup...`, 'system');
                 vscode.commands.executeCommand('watchdog.cleanup');
             }
         }
@@ -193,14 +213,14 @@ export function activate(context: vscode.ExtensionContext) {
         const terminals = await detectHiddenTerminals();
 
         if (terminals.length === 0) {
-            log('[CLEANUP] No hidden terminals to cleanup');
+            log('[CLEANUP] No hidden terminals to cleanup', 'cleanup');
             vscode.window.showInformationMessage('Hidden Terminal Watchdog: No hidden terminals found');
             return;
         }
 
         outputChannel.show(true);
         log('');
-        log(`=== Force Cleanup ===`);
+        log(`=== Force Cleanup ===`, 'cleanup');
         log(`Date: ${new Date().toISOString()}`);
         log(`Cleaning ${terminals.length} hidden terminals...`);
 
@@ -249,9 +269,57 @@ export function activate(context: vscode.ExtensionContext) {
         );
     });
 
-    // Log periodic heartbeat
+    // Log periodic heartbeat with recent events
     const heartbeat = setInterval(() => {
-        log(`[HEARTBEAT] Watchdog active. Tracked: ${trackedTerminals.size}, Last hidden: ${lastCount}`);
+        const now = new Date();
+        const recentWindow = 60000; // Last 60 seconds
+        const recentEventsInWindow = recentEvents.filter(e =>
+            (now.getTime() - e.timestamp.getTime()) < recentWindow
+        );
+
+        // Build heartbeat message with event summary
+        let heartbeatMsg = `[HEARTBEAT] Watchdog active. Tracked: ${trackedTerminals.size}, Last hidden: ${lastCount}`;
+
+        if (recentEventsInWindow.length > 0) {
+            // Count events by type
+            const eventCounts = {
+                terminal_open: 0,
+                terminal_close: 0,
+                monitor: 0,
+                cleanup: 0,
+                warning: 0,
+                system: 0
+            };
+
+            recentEventsInWindow.forEach(e => {
+                eventCounts[e.type]++;
+            });
+
+            // Add event summary to heartbeat
+            const eventSummary: string[] = [];
+            if (eventCounts.terminal_open > 0) eventSummary.push(`${eventCounts.terminal_open} opened`);
+            if (eventCounts.terminal_close > 0) eventSummary.push(`${eventCounts.terminal_close} closed`);
+            if (eventCounts.monitor > 0) eventSummary.push(`${eventCounts.monitor} monitor`);
+            if (eventCounts.cleanup > 0) eventSummary.push(`${eventCounts.cleanup} cleanup`);
+            if (eventCounts.warning > 0) eventSummary.push(`${eventCounts.warning} warnings`);
+            if (eventCounts.system > 0) eventSummary.push(`${eventCounts.system} system`);
+
+            if (eventSummary.length > 0) {
+                heartbeatMsg += ` | Events (60s): ${eventSummary.join(', ')}`;
+            }
+
+            // Add last 3 event messages
+            const lastThree = recentEventsInWindow.slice(-3);
+            if (lastThree.length > 0) {
+                heartbeatMsg += ` | Recent: `;
+                lastThree.forEach((e, i) => {
+                    const timeAgo = Math.floor((now.getTime() - e.timestamp.getTime()) / 1000);
+                    heartbeatMsg += `${i > 0 ? '; ' : ''}[${timeAgo}s ago] ${e.message}`;
+                });
+            }
+        }
+
+        log(heartbeatMsg);
     }, 60000); // Every 60 seconds
 
     // Save subscriptions
