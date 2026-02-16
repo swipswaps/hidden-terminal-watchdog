@@ -23,6 +23,14 @@
       {
         "command": "watchdog.monitor",
         "title": "Hidden Terminal Watchdog: Show Status"
+      },
+      {
+        "command": "hidden-terminal-watchdog.createTerminal",
+        "title": "Watchdog: Create Terminal with Output Capture"
+      },
+      {
+        "command": "hidden-terminal-watchdog.executeCommand",
+        "title": "Watchdog: Execute Command with Output Capture"
       }
     ],
     "configuration": {
