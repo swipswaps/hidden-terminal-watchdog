@@ -190,6 +190,16 @@ function monitorTerminalOutput() {
                     log(`TERMINAL OUTPUT | File: ${filename} | Lines: ${lines.length}`);
                     lines.forEach(line => {
                         log(`  ${line}`);
+
+                        // DETECT STALL PATTERNS
+                        if (line.includes('Waiting for user input')) {
+                            log(`🔴 STALL DETECTED | "Waiting for user input" when user said "proceed"`);
+                            log(`🔴 VIOLATION | RULE 0 - Emission gate failure - guessing instead of executing`);
+                        }
+
+                        if (line.includes('pkill')) {
+                            log(`⚠️ BACKEND KILL DETECTED | Command: ${line}`);
+                        }
                     });
 
                 } catch (err) {
